@@ -37,6 +37,17 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/share/swift /usr/local/.ghcup /opt/ghc /opt/az /opt/microsoft /opt/google /usr/local/share/powershell /usr/local/share/chromium
           df -h /
+      # The app module's Kotlin compile needs more memory than the runner's 16 GB RAM
+      # comfortably allows; extra swap keeps it from being OOM-killed at the peak.
+      - name: Add swap space
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 10G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
       # Toolchain matches the project's own android.yml (JDK 21)
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -47,16 +58,17 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
-      # gradle.properties asks for a 12 GB heap (+4 GB Kotlin daemon), more than the
-      # 16 GB standard runner can give; later entries override the earlier ones.
+      # gradle.properties asks for a 12 GB heap plus a separate 4 GB Kotlin daemon, more
+      # than the 16 GB runner has. Compile Kotlin inside the Gradle JVM instead, so one
+      # 10 GB heap serves both; later entries in gradle.properties override earlier ones.
       # Signal uses ABI splits with a universal APK, so build the Play/prod debug APKs.
       - name: Build the app
         timeout-minutes: 90
         run: |
           {
             echo ""
-            echo "org.gradle.jvmargs=-Xmx6g -Xms256m -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC -Dfile.encoding=UTF-8"
-            echo "kotlin.daemon.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=512m"
+            echo "org.gradle.jvmargs=-Xmx10g -Xms256m -XX:MaxMetaspaceSize=1536m -XX:+UseParallelGC -Dfile.encoding=UTF-8"
+            echo "kotlin.compiler.execution.strategy=in-process"
             echo "org.gradle.workers.max=2"
           } >> gradle.properties
           ./gradlew :Signal-Android:assemblePlayProdDebug --no-daemon
