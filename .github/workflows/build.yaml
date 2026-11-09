@@ -59,7 +59,7 @@ jobs:
             echo "kotlin.daemon.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=512m"
             echo "org.gradle.workers.max=2"
           } >> gradle.properties
-          ./gradlew :app:assemblePlayProdDebug --no-daemon
+          ./gradlew :Signal-Android:assemblePlayProdDebug --no-daemon
       - name: Locate the universal APK
         run: |
           APK_DIR=app/build/outputs/apk/playProd/debug
