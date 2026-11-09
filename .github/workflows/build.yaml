@@ -1,0 +1,108 @@
+# The name of our workflow
+name: Appknox Build
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      riskThreshold:
+        description: "Risk Threshold"
+        required: false
+        default: CRITICAL
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  RISK_THRESHOLD: CRITICAL
+  APPKNOX_ACCESS_TOKEN: 12113443ec9b5c141adc459f9afec11830d709d4
+  APPKNOX_API_HOST: https://autofix.staging.appknox.io/
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set risk threshold for push
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          echo "RISK_THRESHOLD=${{ env.RISK_THRESHOLD }}" >> $GITHUB_ENV
+      - name: Set risk threshold for workflow_dispatch
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "RISK_THRESHOLD=${{ github.event.inputs.riskThreshold }}" >> $GITHUB_ENV
+      # Signal is large; drop toolchains the build doesn't use (keeps the Android SDK)
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/share/swift /usr/local/.ghcup /opt/ghc /opt/az /opt/microsoft /opt/google /usr/local/share/powershell /usr/local/share/chromium
+          df -h /
+      # Toolchain matches the project's own android.yml (JDK 21)
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+      - name: Set up Gradle (caching)
+        uses: gradle/actions/setup-gradle@v4
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+      # gradle.properties asks for a 12 GB heap (+4 GB Kotlin daemon), more than the
+      # 16 GB standard runner can give; later entries override the earlier ones.
+      # Signal uses ABI splits with a universal APK, so build the Play/prod debug APKs.
+      - name: Build the app
+        timeout-minutes: 90
+        run: |
+          {
+            echo ""
+            echo "org.gradle.jvmargs=-Xmx6g -Xms256m -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC -Dfile.encoding=UTF-8"
+            echo "kotlin.daemon.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=512m"
+            echo "org.gradle.workers.max=2"
+          } >> gradle.properties
+          ./gradlew :app:assemblePlayProdDebug --no-daemon
+      - name: Locate the universal APK
+        run: |
+          APK_DIR=app/build/outputs/apk/playProd/debug
+          APP_PATH="$(find "$APK_DIR" -name '*universal*.apk' | head -n 1)"
+          test -n "$APP_PATH" || { echo "No universal APK found:"; ls -R app/build/outputs/apk || true; exit 1; }
+          echo "Built APK: $APP_PATH"
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signal-play-prod-universal.apk
+          path: ${{ env.APP_PATH }}
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Checkout appknox-go
+        uses: actions/checkout@v4
+        with:
+          repository: appknox/appknox-go
+          ref: feature/knoxfixer
+          path: appknox-go
+      - name: Build appknox CLI
+        working-directory: appknox-go
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/bin"
+          go build -o "$GITHUB_WORKSPACE/bin/appknox" .
+      - name: Upload app and run Appknox cicheck
+        id: appknox_scan
+        continue-on-error: true
+        run: |
+          FILE_ID=$(./bin/appknox upload "$APP_PATH" --knoxiq)
+          echo "Uploaded file id: $FILE_ID"
+          echo "file_id=$FILE_ID" >> "$GITHUB_OUTPUT"
+          ./bin/appknox cicheck "$FILE_ID" --risk-threshold "${RISK_THRESHOLD}"
+      - name: Run Appknox autofix
+        if: steps.appknox_scan.outputs.file_id != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          APPKNOX=./bin/appknox
+          FILE_ID="${{ steps.appknox_scan.outputs.file_id }}"
+          $APPKNOX knoxfixer --file-id "$FILE_ID"
+      - name: Fail if cicheck found issues
+        if: steps.appknox_scan.outcome == 'failure'
+        run: exit 1
